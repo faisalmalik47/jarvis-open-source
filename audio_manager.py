@@ -24,6 +24,8 @@ class AudioManager:
         self.is_playing = False
         self.last_playback_time = 0.0
 
+        self.turn_generation = 0
+
     def start(self, loop: asyncio.AbstractEventLoop):
         """Start microphone input and speaker output streams."""
         self._loop = loop
@@ -60,13 +62,19 @@ class AudioManager:
         loop = asyncio.get_running_loop()
         while self.is_running:
             try:
-                data = await self.output_queue.get()
-                if not data or not self.output_stream:
+                item = await self.output_queue.get()
+                if not item or not self.output_stream:
+                    continue
+                gen_id, data = item
+                # If chunk belongs to an interrupted or previous turn, discard immediately
+                if gen_id != self.turn_generation:
                     continue
                 self.is_playing = True
                 try:
                     await loop.run_in_executor(None, self.output_stream.write, data)
                     self.last_playback_time = time.time()
+                except Exception:
+                    pass
                 finally:
                     if self.output_queue.empty():
                         self.is_playing = False
@@ -83,24 +91,32 @@ class AudioManager:
             return True
         if self.is_playing:
             return True
-        # Allow 200ms for acoustic room echo from laptop speakers to dissipate
-        if (time.time() - self.last_playback_time) < 0.20:
+        # Allow 150ms for acoustic room echo from laptop speakers to dissipate
+        if (time.time() - self.last_playback_time) < 0.15:
             return True
         return False
 
     def queue_output(self, data: bytes):
-        """Enqueue downstream audio chunk from Gemini."""
-        if self.is_running:
-            self.output_queue.put_nowait(data)
+        """Enqueue downstream audio chunk from Gemini tagged with the current turn generation."""
+        if self.is_running and data:
+            self.output_queue.put_nowait((self.turn_generation, data))
 
     def flush_output(self):
-        """Immediately clear playback queue on user interruption (barge-in)."""
+        """Immediately aborts playback, clears pending queues, and purges hardware DAC buffers."""
+        self.turn_generation += 1
         self.is_playing = False
         while not self.output_queue.empty():
             try:
                 self.output_queue.get_nowait()
             except Exception:
                 break
+        # Force PortAudio hardware output buffer to immediately drop playing samples
+        if self.output_stream:
+            try:
+                self.output_stream.stop_stream()
+                self.output_stream.start_stream()
+            except Exception:
+                pass
 
     def stop(self):
         """Gracefully release audio streams and hardware resources."""

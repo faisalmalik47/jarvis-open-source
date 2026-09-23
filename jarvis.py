@@ -1,6 +1,10 @@
 import asyncio
 import os
 import sys
+import time
+import select
+import termios
+import tty
 import numpy as np
 from dotenv import load_dotenv
 from google import genai
@@ -74,6 +78,76 @@ Core Persona & Iron Man Protocols:
 """
 
 
+class WakeWordGate:
+    """Manages conversational state: STANDBY vs ACTIVE.
+    
+    STANDBY:
+    - JARVIS listens quietly.
+    - If ambient conversation does NOT address JARVIS ("Jarvis"), model audio output is suppressed.
+    - Audio output remains dead silent.
+    
+    ACTIVE:
+    - Triggered when "Jarvis" / "Hey Jarvis" is detected in user speech, or by pressing Spacebar.
+    - Full bidirectional speech permitted.
+    - Stays active during conversation and for an 8-second follow-up window after speech finishes.
+    - If 8 seconds elapse without user speech, smoothly returns to STANDBY.
+    """
+
+    def __init__(self, timeout_sec: float = 8.0):
+        self.state = "STANDBY"
+        self.timeout_sec = timeout_sec
+        self.last_speech_time = 0.0
+        self.wake_words = [
+            "jarvis",
+            "hey jarvis",
+            "ok jarvis",
+            "okay jarvis",
+            "hi jarvis",
+            "j.a.r.v.i.s.",
+            "travis",
+            "javis",
+            "charvis",
+        ]
+
+    def is_active(self) -> bool:
+        if self.state == "ACTIVE":
+            if time.time() - self.last_speech_time > self.timeout_sec:
+                self.state = "STANDBY"
+                print("\n💤 [JARVIS entered Standby. Say 'Jarvis' or tap Space to activate.]\n", flush=True)
+                log_event("STATE_CHANGE", {"to": "STANDBY", "reason": "timeout"})
+                return False
+            return True
+        return False
+
+    def activate(self, reason: str = "wake_word"):
+        self.state = "ACTIVE"
+        self.last_speech_time = time.time()
+        log_event("STATE_CHANGE", {"to": "ACTIVE", "reason": reason})
+
+    def touch(self):
+        """Refreshes the active conversation window."""
+        if self.state == "ACTIVE":
+            self.last_speech_time = time.time()
+
+    def check_wake_word(self, text: str) -> bool:
+        if not text:
+            return False
+        clean = text.lower().strip()
+        return any(w in clean for w in self.wake_words)
+
+
+class TurnState:
+    """Tracks per-turn interruption and suppression state."""
+
+    def __init__(self):
+        self.interrupted = False
+        self.suppressed = False
+
+    def reset_for_turn(self):
+        self.interrupted = False
+        self.suppressed = False
+
+
 def validate_api_key(api_key: str):
     """Checks that the API key is configured."""
     if not api_key or api_key == "your_gemini_api_key_here":
@@ -81,19 +155,18 @@ def validate_api_key(api_key: str):
     return True, "Valid"
 
 
-async def send_mic_loop(session, audio_mgr: AudioManager):
+async def send_mic_loop(session, audio_mgr: AudioManager, gate: WakeWordGate, turn_state: TurnState):
     """Continuously streams microphone PCM audio chunks to Gemini Live.
     
     Acoustic Management & Barge-In:
     - When Jarvis is speaking, we watch for user barge-in. If the user speaks
-      firmly (RMS > 900), we immediately cut off Jarvis's speech and stream the user's voice.
-    - Software Noise Gate: When ambient room noise is low (RMS < 300), we send
+      firmly (RMS > 520), we immediately cut off Jarvis's speech and stream the user's voice.
+    - Software Noise Gate: When ambient room noise is low (RMS < 320), we send
       zeroed comfort frames to prevent Gemini VAD from hallucinating speech on fan/room hum.
     """
     silent_frames = 0
     silence_warned = False
     user_speaking = False
-    consecutive_loud_interrupt_frames = 0
 
     try:
         while audio_mgr.is_running:
@@ -105,38 +178,31 @@ async def send_mic_loop(session, audio_mgr: AudioManager):
 
                 # Voice Barge-In: If Jarvis is speaking, detect if user is interrupting
                 if audio_mgr.is_speaking():
-                    if rms > 900:  # User speaking over laptop speakers
-                        consecutive_loud_interrupt_frames += 1
-                        if consecutive_loud_interrupt_frames >= 2:
-                            # Instant Voice Interruption!
-                            audio_mgr.flush_output()
-                            consecutive_loud_interrupt_frames = 0
-                            print("\n⚡ [Interrupted by Sir]", flush=True)
-                            log_interruption("VOICE_BARGE_IN", f"Microphone RMS: {rms:.1f}")
-                            await session.send_realtime_input(
-                                audio=types.Blob(data=chunk, mime_type="audio/pcm;rate=16000")
-                            )
-                    else:
-                        consecutive_loud_interrupt_frames = 0
-                    
+                    if rms > 520:  # User speaking over laptop speakers
+                        turn_state.interrupted = True
+                        audio_mgr.flush_output()
+                        gate.activate("voice_barge_in")
+                        print("\n⚡ [Interrupted by Sir]", flush=True)
+                        log_interruption("VOICE_BARGE_IN", f"Microphone RMS: {rms:.1f}")
+                        await session.send_realtime_input(
+                            audio=types.Blob(data=chunk, mime_type="audio/pcm;rate=16000")
+                        )
                     audio_mgr.input_queue.task_done()
                     continue
 
-                consecutive_loud_interrupt_frames = 0
-
                 # Visual feedback when the user's voice is detected
-                if rms > 350:
+                if rms > 400:
                     if not user_speaking:
                         print("\r🎙️  [Hearing your voice...]", end="", flush=True)
                         user_speaking = True
                         log_event("MIC_ACTIVITY", {"status": "speech_started", "rms": round(rms, 1)})
-                elif rms < 180 and user_speaking:
+                elif rms < 200 and user_speaking:
                     user_speaking = False
                     log_event("MIC_ACTIVITY", {"status": "speech_ended", "rms": round(rms, 1)})
 
-                # Noise Gate: If input is ambient murmur/fan hum (<250 RMS), send silence
+                # Noise Gate: If input is ambient murmur/fan hum (<320 RMS), send silence
                 # This prevents Gemini VAD from hallucinating speech and talking unprompted.
-                payload_data = chunk if rms >= 250 else b'\x00' * len(chunk)
+                payload_data = chunk if rms >= 320 else b'\x00' * len(chunk)
 
                 # Detect if microphone is delivering pure silence (all zeros) due to macOS TCC
                 if rms == 0.0:
@@ -162,7 +228,7 @@ async def send_mic_loop(session, audio_mgr: AudioManager):
         print(f"\n[Mic Stream Error]: {e}", file=sys.stderr)
 
 
-async def receive_gemini_loop(session, audio_mgr: AudioManager):
+async def receive_gemini_loop(session, audio_mgr: AudioManager, gate: WakeWordGate, turn_state: TurnState):
     """Continuously receives streaming audio chunks and tool calls from Gemini Live across all turns."""
     speaking = False
     current_transcript = []
@@ -175,16 +241,49 @@ async def receive_gemini_loop(session, audio_mgr: AudioManager):
                 # Check for server content (audio + text + interruptions)
                 server_content = response.server_content
                 if server_content is not None:
-                    # Handle Barge-In: User spoke while Jarvis was speaking
+                    # 1. Inspect real-time transcription from Gemini
+                    interim_trans = getattr(server_content, "interim_input_transcription", None)
+                    input_trans = getattr(server_content, "input_transcription", None)
+
+                    user_text = ""
+                    if interim_trans and interim_trans.text:
+                        user_text = interim_trans.text
+                    elif input_trans and input_trans.text:
+                        user_text = input_trans.text
+
+                    if user_text:
+                        if gate.check_wake_word(user_text):
+                            if not gate.is_active():
+                                print(f"\n⚡ [Wake Word Detected: \"Jarvis\"]", flush=True)
+                            gate.activate("wake_word")
+                            log_transcript("USER", user_text)
+                        elif gate.is_active():
+                            gate.touch()
+                            log_transcript("USER", user_text)
+
+                    # 2. Handle Server-Side Interruption
                     if getattr(server_content, "interrupted", False):
+                        turn_state.interrupted = True
                         audio_mgr.flush_output()
                         speaking = False
                         print("\n⚡ [Interrupted]", flush=True)
                         log_interruption("SERVER_VAD", "Gemini detected user speech during turn")
 
-                    # Process returned model output parts
+                    # 3. Process returned model output parts
                     model_turn = getattr(server_content, "model_turn", None)
                     if model_turn is not None:
+                        # If this turn was interrupted by Sir, discard remaining chunks
+                        if turn_state.interrupted:
+                            continue
+
+                        # If Sir did not say Jarvis and we are not in active conversation window:
+                        if not gate.is_active():
+                            if not turn_state.suppressed:
+                                print("\r💤 [Ambient speech ignored - Say 'Jarvis' or tap Space to address JARVIS]", flush=True)
+                                log_event("SPEECH_SUPPRESSED", {"user_transcript": user_text})
+                                turn_state.suppressed = True
+                            continue
+
                         for part in model_turn.parts:
                             # Stream audio output to speaker queue
                             if part.inline_data and part.inline_data.data:
@@ -199,6 +298,7 @@ async def receive_gemini_loop(session, audio_mgr: AudioManager):
                                 print(part.text, end="", flush=True)
                                 current_transcript.append(part.text)
 
+                    # 4. Turn Complete
                     if getattr(server_content, "turn_complete", False):
                         if current_transcript:
                             full_text = "".join(current_transcript).strip()
@@ -207,6 +307,8 @@ async def receive_gemini_loop(session, audio_mgr: AudioManager):
                         if speaking:
                             print("✓\n🟢 JARVIS is listening...\n", flush=True)
                             speaking = False
+                            gate.touch()
+                        turn_state.reset_for_turn()
 
                 # Check for GoAway signal (session duration limit reached by Google)
                 if response.go_away is not None:
@@ -253,6 +355,56 @@ async def receive_gemini_loop(session, audio_mgr: AudioManager):
         print(f"\n[Receive Loop Error]: {e}", file=sys.stderr)
 
 
+async def keyboard_listener_loop(audio_mgr: AudioManager, gate: WakeWordGate, turn_state: TurnState):
+    """Zero-latency keyboard monitor.
+    - While JARVIS is speaking: ANY key instantly halts speech!
+    - While idle: Spacebar wakes JARVIS directly into ACTIVE mode.
+    """
+    if not sys.stdin.isatty():
+        return
+
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    tty.setcbreak(fd)
+
+    try:
+        loop = asyncio.get_running_loop()
+        while audio_mgr.is_running:
+            r, _, _ = await loop.run_in_executor(None, select.select, [sys.stdin], [], [], 0.08)
+            if r:
+                char = sys.stdin.read(1)
+                if char == '\x03':  # Ctrl+C
+                    raise KeyboardInterrupt()
+
+                if audio_mgr.is_speaking():
+                    turn_state.interrupted = True
+                    audio_mgr.flush_output()
+                    print("\n⚡ [Interrupted by Keypress] Speech halted.", flush=True)
+                    log_interruption("KEYPRESS", f"Key '{repr(char)}' pressed")
+                else:
+                    if char == ' ':
+                        gate.activate("spacebar_press")
+                        print("\n⚡ [J.A.R.V.I.S. Activated by Spacebar] Listening for Sir's command...", flush=True)
+            await asyncio.sleep(0.02)
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        pass
+    except Exception as e:
+        log_error("keyboard_listener", e)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+
+async def standby_monitor_loop(audio_mgr: AudioManager, gate: WakeWordGate):
+    """Periodically checks if the active conversation window has expired."""
+    while audio_mgr.is_running:
+        try:
+            await asyncio.sleep(1.0)
+            if not audio_mgr.is_speaking():
+                gate.is_active()  # triggers state transition to STANDBY if timed out
+        except asyncio.CancelledError:
+            break
+
+
 async def run_session():
     valid, reason = validate_api_key(API_KEY)
     if not valid:
@@ -260,8 +412,10 @@ async def run_session():
         return False
 
     audio_mgr = AudioManager()
+    gate = WakeWordGate(timeout_sec=8.0)
+    turn_state = TurnState()
 
-    # Configure the Gemini Live Session with zero thinking delay for instant speech
+    # Configure the Gemini Live Session with input/output audio transcription
     config = types.LiveConnectConfig(
         response_modalities=["AUDIO"],
         speech_config=types.SpeechConfig(
@@ -270,6 +424,8 @@ async def run_session():
             )
         ),
         thinking_config=types.ThinkingConfig(thinking_budget=0, include_thoughts=False),
+        input_audio_transcription=types.AudioTranscriptionConfig(),
+        output_audio_transcription=types.AudioTranscriptionConfig(),
         system_instruction=types.Content(
             parts=[types.Part.from_text(text=SYSTEM_INSTRUCTION)]
         ),
@@ -286,35 +442,23 @@ async def run_session():
             log_session_lifecycle("CONNECTED", {"model": MODEL_ID, "voice": VOICE_NAME})
             print("🟢 J.A.R.V.I.S. is online. All protocols fully operational.")
             print("   🎙️  Wake word: Start your request with 'Jarvis' (e.g. 'Jarvis, check my system')")
-            print("   ⚡ Interruption: Speak loudly to interrupt, or press [Enter] in the terminal anytime.\n")
+            print("   ⚡ Spacebar: Tap [Space] to activate without saying wake word, or tap ANY key to halt speech!")
+            print("   🔇 Voice Barge-In: Speak firmly to interrupt JARVIS mid-sentence.\n")
 
-            # Initial spoken greeting to announce arrival aloud
+            # Activate gate for initial arrival greeting
+            gate.activate("initial_greeting")
             await session.send_client_content(
                 turns=[types.Content(role="user", parts=[types.Part.from_text(text="[SYSTEM PROTOCOL: Assistant initialized. Welcome Sir in one brief, elegant J.A.R.V.I.S. sentence, confirming all systems are online.]")])],
                 turn_complete=True
             )
 
-            async def keyboard_interrupt_loop():
-                """Allows Sir to press Enter at any moment in the terminal to immediately cut off speech."""
-                loop = asyncio.get_running_loop()
-                while audio_mgr.is_running:
-                    try:
-                        line = await loop.run_in_executor(None, sys.stdin.readline)
-                        if not line and not audio_mgr.is_running:
-                            break
-                        if audio_mgr.is_speaking():
-                            audio_mgr.flush_output()
-                            print("\n⚡ [Interrupted by Keypress] Speech halted.", flush=True)
-                            log_interruption("KEYPRESS_ENTER", "User pressed Enter in terminal to halt speech")
-                    except Exception:
-                        break
-
             playback_task = asyncio.create_task(audio_mgr.play_audio_loop())
-            mic_task = asyncio.create_task(send_mic_loop(session, audio_mgr))
-            recv_task = asyncio.create_task(receive_gemini_loop(session, audio_mgr))
-            key_task = asyncio.create_task(keyboard_interrupt_loop())
+            mic_task = asyncio.create_task(send_mic_loop(session, audio_mgr, gate, turn_state))
+            recv_task = asyncio.create_task(receive_gemini_loop(session, audio_mgr, gate, turn_state))
+            key_task = asyncio.create_task(keyboard_listener_loop(audio_mgr, gate, turn_state))
+            monitor_task = asyncio.create_task(standby_monitor_loop(audio_mgr, gate))
 
-            await asyncio.gather(mic_task, recv_task, playback_task, key_task)
+            await asyncio.gather(mic_task, recv_task, playback_task, key_task, monitor_task)
 
     except (KeyboardInterrupt, asyncio.CancelledError):
         print("\n\nShutting down JARVIS...")

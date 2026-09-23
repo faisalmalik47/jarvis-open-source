@@ -7,7 +7,11 @@ A full-duplex, sub-second real-time streaming voice AI assistant designed native
 ## ⚡ Key Highlights
 
 * **Direct Audio-to-Audio Streaming**: Direct raw PCM 16kHz microphone capture streamed to Gemini Live WebSockets with 24kHz speaker playback (~500ms voice turnaround).
-* **True Barge-In & Acoustic Echo Cancellation**: Speak mid-sentence and JARVIS pauses immediately. Includes software acoustic echo gating so laptop speakers never trigger self-interruption.
+* **Wake-Word Gating & Ambient Filtering**: Only responds when addressed by name (*"Jarvis"*, *"Hey Jarvis"*). Background room banter, TV chatter, and ambient noise are automatically suppressed so JARVIS never speaks unprompted. Includes an 8-second conversational follow-up window for seamless back-and-forth dialog.
+* **Instant Interruption (Voice & Keyboard)**:
+  - **Voice Barge-In**: Speak firmly mid-sentence to immediately cut off speech and issue a new command.
+  - **Zero-Latency Keyboard Stop**: Tap ANY key (Spacebar, Enter, Esc) while JARVIS is speaking to halt playback in 0ms via direct PortAudio DAC ring-buffer purging.
+  - **Spacebar Push-to-Wake**: Tap Spacebar anytime during Standby to activate JARVIS directly without saying the wake word.
 * **MCU Iron Man Persona**: Styled with Paul Bettany's refined British cadence, deadpan wit, unyielding composure, and addressing you exclusively as *"Sir"*.
 * **Auto-Rotating Session Management**: Seamlessly handles Google's 15-minute `GoAway` duration limits with 1-second auto-reconnects for continuous uptime.
 
