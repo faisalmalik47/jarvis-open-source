@@ -159,8 +159,9 @@ async def send_mic_loop(session, audio_mgr: AudioManager, gate: WakeWordGate, tu
     """Continuously streams microphone PCM audio chunks to Gemini Live.
     
     Acoustic Management & Barge-In:
-    - When Jarvis is speaking, we watch for user barge-in. If the user speaks
-      firmly (RMS > 520), we immediately cut off Jarvis's speech and stream the user's voice.
+    - When Jarvis is speaking through the laptop speakers, the laptop microphone hears
+      the speaker output. We stream silence comfort frames while speaking to prevent
+      Gemini's server VAD from self-interrupting on laptop speaker audio.
     - Software Noise Gate: When ambient room noise is low (RMS < 320), we send
       zeroed comfort frames to prevent Gemini VAD from hallucinating speech on fan/room hum.
     """
@@ -176,9 +177,11 @@ async def send_mic_loop(session, audio_mgr: AudioManager, gate: WakeWordGate, tu
                 samples = np.frombuffer(chunk, dtype=np.int16)
                 rms = float(np.sqrt(np.mean(samples.astype(np.float64)**2)))
 
-                # Voice Barge-In: If Jarvis is speaking, detect if user is interrupting
+                # Acoustic Echo Suppression:
+                # If Jarvis is speaking through the speakers, send comfort silence frames
+                # to Gemini so the server VAD doesn't self-interrupt on speaker output.
                 if audio_mgr.is_speaking():
-                    if rms > 520:  # User speaking over laptop speakers
+                    if rms > 2500:  # Deliberate user shout over full speaker volume
                         turn_state.interrupted = True
                         audio_mgr.flush_output()
                         gate.activate("voice_barge_in")
@@ -186,6 +189,11 @@ async def send_mic_loop(session, audio_mgr: AudioManager, gate: WakeWordGate, tu
                         log_interruption("VOICE_BARGE_IN", f"Microphone RMS: {rms:.1f}")
                         await session.send_realtime_input(
                             audio=types.Blob(data=chunk, mime_type="audio/pcm;rate=16000")
+                        )
+                    else:
+                        # Send comfort silence while speakers are active
+                        await session.send_realtime_input(
+                            audio=types.Blob(data=b'\x00' * len(chunk), mime_type="audio/pcm;rate=16000")
                         )
                     audio_mgr.input_queue.task_done()
                     continue
@@ -261,13 +269,14 @@ async def receive_gemini_loop(session, audio_mgr: AudioManager, gate: WakeWordGa
                             gate.touch()
                             log_transcript("USER", user_text)
 
-                    # 2. Handle Server-Side Interruption
+                    # 2. Handle Server-Side Interruption (only when Jarvis was actively speaking)
                     if getattr(server_content, "interrupted", False):
-                        turn_state.interrupted = True
-                        audio_mgr.flush_output()
-                        speaking = False
-                        print("\n⚡ [Interrupted]", flush=True)
-                        log_interruption("SERVER_VAD", "Gemini detected user speech during turn")
+                        if speaking:
+                            turn_state.interrupted = True
+                            audio_mgr.flush_output()
+                            speaking = False
+                            print("\n⚡ [Interrupted]", flush=True)
+                            log_interruption("SERVER_VAD", "Gemini detected user speech during turn")
 
                     # 3. Process returned model output parts
                     model_turn = getattr(server_content, "model_turn", None)

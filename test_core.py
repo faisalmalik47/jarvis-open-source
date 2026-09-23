@@ -44,12 +44,14 @@ class TestJarvisCore(unittest.TestCase):
         self.assertFalse(ts.interrupted)
         self.assertFalse(ts.suppressed)
 
-    def test_audio_manager_turn_generation_flush(self):
+    def test_audio_manager_flush(self):
         mgr = AudioManager()
-        initial_gen = mgr.turn_generation
+        mgr.is_running = True
+        mgr.queue_output(b"\x00" * 4096)
+        self.assertTrue(mgr.is_speaking())
         mgr.flush_output()
-        self.assertEqual(mgr.turn_generation, initial_gen + 1)
         self.assertFalse(mgr.is_playing)
+        self.assertEqual(len(mgr._output_buffer), 0)
 
 
 if __name__ == "__main__":
