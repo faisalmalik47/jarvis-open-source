@@ -1,7 +1,5 @@
 import asyncio
-import collections
 import sys
-import threading
 import time
 import pyaudio
 
@@ -13,20 +11,14 @@ OUTPUT_CHUNK_SIZE = 1024
 
 
 class AudioManager:
-    """Manages low-latency audio capture and playback with non-blocking callback architecture.
-    
-    Uses PortAudio streaming callbacks for both microphone capture and speaker output.
-    This completely avoids blocking thread executor calls, prevents PortAudio stream
-    crashes ([Errno -9988] Stream closed), and allows true 0ms hardware playback flushing.
-    """
+    """Manages low-latency audio capture and playback."""
 
     def __init__(self):
         self.pa = pyaudio.PyAudio()
         self.input_stream = None
         self.output_stream = None
         self.input_queue = asyncio.Queue()
-        self._output_buffer = collections.deque()
-        self._buffer_lock = threading.Lock()
+        self.output_queue = asyncio.Queue()
         self._loop = None
         self.is_running = False
         self.is_playing = False
@@ -42,28 +34,6 @@ class AudioManager:
                 self._loop.call_soon_threadsafe(self.input_queue.put_nowait, in_data)
             return (None, pyaudio.paContinue)
 
-        def output_callback(in_data, frame_count, time_info, status):
-            bytes_needed = frame_count * 2  # 16-bit mono = 2 bytes per sample
-            data = bytearray()
-            with self._buffer_lock:
-                while len(data) < bytes_needed and self._output_buffer:
-                    chunk = self._output_buffer.popleft()
-                    data.extend(chunk)
-
-                if len(data) > bytes_needed:
-                    remainder = bytes(data[bytes_needed:])
-                    self._output_buffer.appendleft(remainder)
-                    data = data[:bytes_needed]
-
-            if len(data) < bytes_needed:
-                data.extend(b"\x00" * (bytes_needed - len(data)))
-                self.is_playing = False
-            else:
-                self.is_playing = True
-                self.last_playback_time = time.time()
-
-            return (bytes(data), pyaudio.paContinue)
-
         # 16kHz Mono 16-bit for Gemini Input
         self.input_stream = self.pa.open(
             format=pyaudio.paInt16,
@@ -75,30 +45,42 @@ class AudioManager:
         )
         self.input_stream.start_stream()
 
-        # 24kHz Mono 16-bit for Gemini Output with hardware callback
+        # 24kHz Mono 16-bit for Gemini Output
         self.output_stream = self.pa.open(
             format=pyaudio.paInt16,
             channels=1,
             rate=OUTPUT_SAMPLE_RATE,
             output=True,
             frames_per_buffer=OUTPUT_CHUNK_SIZE,
-            stream_callback=output_callback,
         )
         self.output_stream.start_stream()
 
     async def play_audio_loop(self):
-        """Asynchronously maintains playback coroutine lifecycle."""
-        try:
-            while self.is_running:
-                await asyncio.sleep(0.1)
-        except asyncio.CancelledError:
-            pass
+        """Asynchronously plays audio bytes queued from Gemini's live stream."""
+        loop = asyncio.get_running_loop()
+        while self.is_running:
+            try:
+                data = await self.output_queue.get()
+                if not data or not self.output_stream:
+                    continue
+                self.is_playing = True
+                try:
+                    await loop.run_in_executor(None, self.output_stream.write, data)
+                    self.last_playback_time = time.time()
+                finally:
+                    if self.output_queue.empty():
+                        self.is_playing = False
+            except asyncio.CancelledError:
+                self.is_playing = False
+                break
+            except Exception as e:
+                self.is_playing = False
+                print(f"[Audio Error] Playback: {e}", file=sys.stderr)
 
     def is_speaking(self) -> bool:
         """Returns True if Jarvis is currently playing audio or reverberating in the room."""
-        with self._buffer_lock:
-            if len(self._output_buffer) > 0:
-                return True
+        if not self.output_queue.empty():
+            return True
         if self.is_playing:
             return True
         # Allow 200ms for acoustic room echo from laptop speakers to dissipate
@@ -107,18 +89,18 @@ class AudioManager:
         return False
 
     def queue_output(self, data: bytes):
-        """Enqueue downstream audio chunk from Gemini into playback buffer."""
-        if self.is_running and data:
-            with self._buffer_lock:
-                self._output_buffer.append(data)
-            self.is_playing = True
-            self.last_playback_time = time.time()
+        """Enqueue downstream audio chunk from Gemini."""
+        if self.is_running:
+            self.output_queue.put_nowait(data)
 
     def flush_output(self):
-        """Instantly purge all buffered playback audio in 0ms without closing PortAudio stream."""
-        with self._buffer_lock:
-            self._output_buffer.clear()
+        """Immediately clear playback queue."""
         self.is_playing = False
+        while not self.output_queue.empty():
+            try:
+                self.output_queue.get_nowait()
+            except Exception:
+                break
 
     def stop(self):
         """Gracefully release audio streams and hardware resources."""
