@@ -67,3 +67,16 @@ Get a free Gemini API key from [Google AI Studio](https://aistudio.google.com/ap
 * *"Jarvis, play Chammak Challo on YouTube Music."*
 * *"Jarvis, take a screenshot and toggle Dark Mode."*
 * *"Jarvis, execute a shell command to show my uptime."*
+
+---
+
+## 📊 Comprehensive Logging & Telemetry
+
+JARVIS automatically maintains detailed logs in the `logs/` directory for ongoing evaluation, debugging, and continuous improvement:
+
+* **Human-Readable Rolling Log (`logs/jarvis_debug.log`)**:
+  - Detailed millisecond-resolution logs of session lifecycle, microphone energy/noise gating, tool execution durations, transcript text, interruptions, and complete exception stack traces.
+  - Automatically rolls over at 10MB (keeps 5 rotating backups).
+* **Machine-Readable Session Log (`logs/jarvis_sessions.jsonl`)**:
+  - Structured JSON Lines telemetry for analyzing conversation history, tool calls, argument payloads, latency metrics, and error rates.
+

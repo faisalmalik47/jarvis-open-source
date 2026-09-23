@@ -21,4 +21,6 @@ __pycache__/
 
 # Logs and scratch files
 *.log
+*.jsonl
+logs/
 scratch/

@@ -651,12 +651,26 @@ TOOL_MAP = {
 
 
 def dispatch_tool(name: str, args: dict) -> dict:
-    """Executes the requested tool and returns a clean dictionary response."""
+    """Executes the requested tool and returns a clean dictionary response with detailed telemetry."""
+    import time
+    from logger import log_tool_execution, jarvis_logger
+
     func = TOOL_MAP.get(name)
     if not func:
-        return {"error": f"Unknown tool: {name}"}
+        res = {"error": f"Unknown tool: {name}"}
+        log_tool_execution(name, args, res, 0.0)
+        return res
+
+    start_time = time.perf_counter()
     try:
         result = func(**args)
-        return {"result": result}
+        duration_ms = (time.perf_counter() - start_time) * 1000.0
+        res = {"result": result}
+        log_tool_execution(name, args, res, duration_ms)
+        return res
     except Exception as e:
-        return {"error": str(e)}
+        duration_ms = (time.perf_counter() - start_time) * 1000.0
+        res = {"error": str(e)}
+        log_tool_execution(name, args, res, duration_ms)
+        return res
+

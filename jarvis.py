@@ -8,6 +8,14 @@ from google.genai import types, live
 
 from audio_manager import AudioManager
 from tools import TOOL_DECLARATIONS, dispatch_tool
+from logger import (
+    jarvis_logger,
+    log_event,
+    log_transcript,
+    log_interruption,
+    log_session_lifecycle,
+    log_error,
+)
 
 # Load environment variables
 load_dotenv()
@@ -104,6 +112,7 @@ async def send_mic_loop(session, audio_mgr: AudioManager):
                             audio_mgr.flush_output()
                             consecutive_loud_interrupt_frames = 0
                             print("\n⚡ [Interrupted by Sir]", flush=True)
+                            log_interruption("VOICE_BARGE_IN", f"Microphone RMS: {rms:.1f}")
                             await session.send_realtime_input(
                                 audio=types.Blob(data=chunk, mime_type="audio/pcm;rate=16000")
                             )
@@ -120,8 +129,10 @@ async def send_mic_loop(session, audio_mgr: AudioManager):
                     if not user_speaking:
                         print("\r🎙️  [Hearing your voice...]", end="", flush=True)
                         user_speaking = True
+                        log_event("MIC_ACTIVITY", {"status": "speech_started", "rms": round(rms, 1)})
                 elif rms < 180 and user_speaking:
                     user_speaking = False
+                    log_event("MIC_ACTIVITY", {"status": "speech_ended", "rms": round(rms, 1)})
 
                 # Noise Gate: If input is ambient murmur/fan hum (<250 RMS), send silence
                 # This prevents Gemini VAD from hallucinating speech and talking unprompted.
@@ -136,6 +147,7 @@ async def send_mic_loop(session, audio_mgr: AudioManager):
                         print("   macOS may be blocking microphone access for this terminal.", flush=True)
                         print("   Check: System Settings > Privacy & Security > Microphone > Enable your Terminal app.\n", flush=True)
                         silence_warned = True
+                        log_error("MIC_STREAM", Exception("Microphone delivering pure silence - possible macOS TCC restriction"))
                 else:
                     silent_frames = 0
 
@@ -146,12 +158,14 @@ async def send_mic_loop(session, audio_mgr: AudioManager):
     except (asyncio.CancelledError, Exception) as e:
         if not audio_mgr.is_running or "closed" in str(e).lower() or "1000" in str(e) or "1011" in str(e):
             return
+        log_error("send_mic_loop", e)
         print(f"\n[Mic Stream Error]: {e}", file=sys.stderr)
 
 
 async def receive_gemini_loop(session, audio_mgr: AudioManager):
     """Continuously receives streaming audio chunks and tool calls from Gemini Live across all turns."""
     speaking = False
+    current_transcript = []
     try:
         while audio_mgr.is_running:
             async for response in session.receive():
@@ -166,6 +180,7 @@ async def receive_gemini_loop(session, audio_mgr: AudioManager):
                         audio_mgr.flush_output()
                         speaking = False
                         print("\n⚡ [Interrupted]", flush=True)
+                        log_interruption("SERVER_VAD", "Gemini detected user speech during turn")
 
                     # Process returned model output parts
                     model_turn = getattr(server_content, "model_turn", None)
@@ -182,8 +197,13 @@ async def receive_gemini_loop(session, audio_mgr: AudioManager):
                             is_thought = getattr(part, "thought", False)
                             if part.text and not is_thought:
                                 print(part.text, end="", flush=True)
+                                current_transcript.append(part.text)
 
                     if getattr(server_content, "turn_complete", False):
+                        if current_transcript:
+                            full_text = "".join(current_transcript).strip()
+                            log_transcript("JARVIS", full_text)
+                            current_transcript.clear()
                         if speaking:
                             print("✓\n🟢 JARVIS is listening...\n", flush=True)
                             speaking = False
@@ -191,6 +211,7 @@ async def receive_gemini_loop(session, audio_mgr: AudioManager):
                 # Check for GoAway signal (session duration limit reached by Google)
                 if response.go_away is not None:
                     print("\n⚡ [J.A.R.V.I.S. Protocol: Session duration reached. Auto-refreshing connection...]", flush=True)
+                    log_session_lifecycle("GO_AWAY_RECEIVED", {"reason": "Session duration reached"})
                     audio_mgr.is_running = False
                     return
 
@@ -228,6 +249,7 @@ async def receive_gemini_loop(session, audio_mgr: AudioManager):
         err_msg = str(e).lower()
         if not audio_mgr.is_running or "closed" in err_msg or "1008" in err_msg or "goaway" in err_msg:
             return
+        log_error("receive_gemini_loop", e)
         print(f"\n[Receive Loop Error]: {e}", file=sys.stderr)
 
 
@@ -257,9 +279,11 @@ async def run_session():
     client = genai.Client(api_key=API_KEY)
 
     try:
+        log_session_lifecycle("CONNECTING", {"model": MODEL_ID, "voice": VOICE_NAME})
         async with client.aio.live.connect(model=MODEL_ID, config=config) as session:
             loop = asyncio.get_running_loop()
             audio_mgr.start(loop)
+            log_session_lifecycle("CONNECTED", {"model": MODEL_ID, "voice": VOICE_NAME})
             print("🟢 J.A.R.V.I.S. is online. All protocols fully operational.")
             print("   🎙️  Wake word: Start your request with 'Jarvis' (e.g. 'Jarvis, check my system')")
             print("   ⚡ Interruption: Speak loudly to interrupt, or press [Enter] in the terminal anytime.\n")
@@ -281,6 +305,7 @@ async def run_session():
                         if audio_mgr.is_speaking():
                             audio_mgr.flush_output()
                             print("\n⚡ [Interrupted by Keypress] Speech halted.", flush=True)
+                            log_interruption("KEYPRESS_ENTER", "User pressed Enter in terminal to halt speech")
                     except Exception:
                         break
 
@@ -293,20 +318,25 @@ async def run_session():
 
     except (KeyboardInterrupt, asyncio.CancelledError):
         print("\n\nShutting down JARVIS...")
+        log_session_lifecycle("SHUTDOWN_REQUESTED", {"reason": "KeyboardInterrupt"})
         return False
     except Exception as e:
         err_str = str(e)
         if "goaway" in err_str.lower() or "session duration" in err_str.lower() or "1008" in err_str:
             print(f"\n⚡ [J.A.R.V.I.S. Protocol: Session duration reached. Auto-refreshing...]", flush=True)
+            log_session_lifecycle("RECONNECT_SCHEDULED", {"reason": err_str})
             return True
         if "403" in err_str or "forbidden" in err_str.lower() or "not allowed by policy" in err_str.lower():
             print(f"\n❌ [Authentication Error]: HTTP 403 Forbidden from Google.", file=sys.stderr)
             print("   Your GEMINI_API_KEY was rejected by Google policy.", file=sys.stderr)
             print("   Please get a valid key at: https://aistudio.google.com/apikey", file=sys.stderr)
+            log_error("SESSION_AUTH", e)
             return False
+        log_error("SESSION_RUN", e)
         print(f"\n[Session Error]: {e}", file=sys.stderr)
         return True
     finally:
+        log_session_lifecycle("SESSION_STOPPED")
         audio_mgr.stop()
 
     return False
@@ -319,14 +349,17 @@ async def main():
     print(f"🎙️  Voice: {VOICE_NAME} | Full macOS System & Filesystem Access")
     print("=" * 64)
     print("Connecting to live audio stream... Press Ctrl+C to exit.\n")
+    log_session_lifecycle("APPLICATION_START", {"model": MODEL_ID, "voice": VOICE_NAME})
 
     while True:
         should_reconnect = await run_session()
         if not should_reconnect:
             break
         print("\n⚡ Reconnecting J.A.R.V.I.S. in 1 second...")
+        log_session_lifecycle("RECONNECT_WAIT", {"delay_sec": 1})
         await asyncio.sleep(1)
 
+    log_session_lifecycle("APPLICATION_EXIT")
     print("Offline. Goodbye, Sir.")
 
 
