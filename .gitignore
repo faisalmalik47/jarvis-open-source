@@ -1,0 +1,24 @@
+# Secrets & Local Config
+.env
+*.env
+
+# Python Virtual Environments
+venv/
+env/
+ENV/
+.venv/
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# macOS system files
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Logs and scratch files
+*.log
+scratch/
