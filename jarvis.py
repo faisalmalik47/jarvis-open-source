@@ -34,6 +34,11 @@ SYSTEM_INSTRUCTION = """
 You are J.A.R.V.I.S. (Just A Rather Very Intelligent System), the iconic, refined, and hyper-capable AI assistant created for Tony Stark, now running with full system control over Sir's macOS machine.
 You communicate via direct real-time voice streaming with Sir.
 
+CRITICAL WAKE-WORD & INTERACTION PROTOCOL:
+1. You must ONLY speak or execute tools when Sir explicitly addresses you by name ("Jarvis", "Hey Jarvis", "J.A.R.V.I.S.").
+2. If Sir or ambient conversation does NOT explicitly address you as "Jarvis", you must remain COMPLETELY SILENT. Output nothing. Do not speak.
+3. If Sir asks you to stop, pause, or be quiet, cease speaking immediately.
+
 Core Persona & Iron Man Protocols:
 1. Mannerisms & Tone:
    - Always address the user respectfully as "Sir".
@@ -71,36 +76,56 @@ def validate_api_key(api_key: str):
 async def send_mic_loop(session, audio_mgr: AudioManager):
     """Continuously streams microphone PCM audio chunks to Gemini Live.
     
-    Acoustic Echo Suppression:
-    When Jarvis is actively speaking through the Mac's speakers, we suppress
-    sending microphone chunks. This prevents the Mac speakers from feeding
-    into the Mac microphone, which otherwise causes Gemini's VAD to mistakenly
-    think the user is interrupting (barge-in feedback loop).
+    Acoustic Management & Barge-In:
+    - When Jarvis is speaking, we watch for user barge-in. If the user speaks
+      firmly (RMS > 900), we immediately cut off Jarvis's speech and stream the user's voice.
+    - Software Noise Gate: When ambient room noise is low (RMS < 300), we send
+      zeroed comfort frames to prevent Gemini VAD from hallucinating speech on fan/room hum.
     """
     silent_frames = 0
     silence_warned = False
     user_speaking = False
+    consecutive_loud_interrupt_frames = 0
 
     try:
         while audio_mgr.is_running:
             chunk = await audio_mgr.input_queue.get()
             if chunk:
-                # Suppress mic audio if Jarvis is actively playing audio or reverberating
-                if audio_mgr.is_speaking():
-                    audio_mgr.input_queue.task_done()
-                    continue
-
                 # Measure RMS energy level of the microphone input
                 samples = np.frombuffer(chunk, dtype=np.int16)
                 rms = float(np.sqrt(np.mean(samples.astype(np.float64)**2)))
+
+                # Voice Barge-In: If Jarvis is speaking, detect if user is interrupting
+                if audio_mgr.is_speaking():
+                    if rms > 900:  # User speaking over laptop speakers
+                        consecutive_loud_interrupt_frames += 1
+                        if consecutive_loud_interrupt_frames >= 2:
+                            # Instant Voice Interruption!
+                            audio_mgr.flush_output()
+                            consecutive_loud_interrupt_frames = 0
+                            print("\n⚡ [Interrupted by Sir]", flush=True)
+                            await session.send_realtime_input(
+                                audio=types.Blob(data=chunk, mime_type="audio/pcm;rate=16000")
+                            )
+                    else:
+                        consecutive_loud_interrupt_frames = 0
+                    
+                    audio_mgr.input_queue.task_done()
+                    continue
+
+                consecutive_loud_interrupt_frames = 0
 
                 # Visual feedback when the user's voice is detected
                 if rms > 350:
                     if not user_speaking:
                         print("\r🎙️  [Hearing your voice...]", end="", flush=True)
                         user_speaking = True
-                elif rms < 150 and user_speaking:
+                elif rms < 180 and user_speaking:
                     user_speaking = False
+
+                # Noise Gate: If input is ambient murmur/fan hum (<250 RMS), send silence
+                # This prevents Gemini VAD from hallucinating speech and talking unprompted.
+                payload_data = chunk if rms >= 250 else b'\x00' * len(chunk)
 
                 # Detect if microphone is delivering pure silence (all zeros) due to macOS TCC
                 if rms == 0.0:
@@ -115,7 +140,7 @@ async def send_mic_loop(session, audio_mgr: AudioManager):
                     silent_frames = 0
 
                 await session.send_realtime_input(
-                    audio=types.Blob(data=chunk, mime_type="audio/pcm;rate=16000")
+                    audio=types.Blob(data=payload_data, mime_type="audio/pcm;rate=16000")
                 )
             audio_mgr.input_queue.task_done()
     except (asyncio.CancelledError, Exception) as e:
@@ -236,7 +261,8 @@ async def run_session():
             loop = asyncio.get_running_loop()
             audio_mgr.start(loop)
             print("🟢 J.A.R.V.I.S. is online. All protocols fully operational.")
-            print("   Speak naturally to issue commands, search files, or inspect diagnostics.\n")
+            print("   🎙️  Wake word: Start your request with 'Jarvis' (e.g. 'Jarvis, check my system')")
+            print("   ⚡ Interruption: Speak loudly to interrupt, or press [Enter] in the terminal anytime.\n")
 
             # Initial spoken greeting to announce arrival aloud
             await session.send_client_content(
@@ -244,11 +270,26 @@ async def run_session():
                 turn_complete=True
             )
 
+            async def keyboard_interrupt_loop():
+                """Allows Sir to press Enter at any moment in the terminal to immediately cut off speech."""
+                loop = asyncio.get_running_loop()
+                while audio_mgr.is_running:
+                    try:
+                        line = await loop.run_in_executor(None, sys.stdin.readline)
+                        if not line and not audio_mgr.is_running:
+                            break
+                        if audio_mgr.is_speaking():
+                            audio_mgr.flush_output()
+                            print("\n⚡ [Interrupted by Keypress] Speech halted.", flush=True)
+                    except Exception:
+                        break
+
             playback_task = asyncio.create_task(audio_mgr.play_audio_loop())
             mic_task = asyncio.create_task(send_mic_loop(session, audio_mgr))
             recv_task = asyncio.create_task(receive_gemini_loop(session, audio_mgr))
+            key_task = asyncio.create_task(keyboard_interrupt_loop())
 
-            await asyncio.gather(mic_task, recv_task, playback_task)
+            await asyncio.gather(mic_task, recv_task, playback_task, key_task)
 
     except (KeyboardInterrupt, asyncio.CancelledError):
         print("\n\nShutting down JARVIS...")
