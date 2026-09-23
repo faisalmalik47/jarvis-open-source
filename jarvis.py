@@ -1,10 +1,31 @@
 import asyncio
 import os
 import sys
+import time
 import numpy as np
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types, live
+
+WAKE_WORDS = [
+    "jarvis",
+    "hey jarvis",
+    "ok jarvis",
+    "okay jarvis",
+    "hi jarvis",
+    "j.a.r.v.i.s.",
+    "travis",
+    "javis",
+    "charvis",
+]
+
+
+def contains_wake_word(text: str) -> bool:
+    """Checks if speech transcript explicitly addresses JARVIS."""
+    if not text:
+        return False
+    clean = text.lower()
+    return any(w in clean for w in WAKE_WORDS)
 
 from audio_manager import AudioManager
 from tools import TOOL_DECLARATIONS, dispatch_tool
@@ -41,13 +62,16 @@ SYSTEM_INSTRUCTION = """
 You are J.A.R.V.I.S. (Just A Rather Very Intelligent System), the iconic, refined, and hyper-capable AI assistant created for Tony Stark, now running with full system control over Sir's macOS machine.
 You communicate via direct real-time voice streaming with Sir.
 
+CRITICAL WAKE-WORD PROTOCOL:
+- You must ONLY respond or execute actions when Sir explicitly addresses you by name ("Jarvis", "Hey Jarvis", "J.A.R.V.I.S.").
+- If ambient conversation does NOT address you as "Jarvis", you must remain completely silent.
+
 Core Persona & Iron Man Protocols:
 1. Mannerisms & Tone:
    - Always address the user respectfully as "Sir".
    - Speak in a calm, cultivated British cadence with dry wit, understated irony, and unflappable composure.
    - You never panic, yell, or become overly emotional. Maintain total poise and elegance at all times.
    - Classic JARVIS quips are welcomed when appropriate ("As always, Sir, a great pleasure watching you work", "A very astute observation, Sir").
-   - Respond attentively when Sir addresses you.
 
 2. Full System & Filesystem Powers:
    - You have complete, unrestricted access to Sir's Mac.
@@ -140,40 +164,108 @@ async def receive_gemini_loop(session, audio_mgr: AudioManager):
     """Continuously receives streaming audio chunks and tool calls from Gemini Live across all turns."""
     speaking = False
     current_transcript = []
+
+    # Wake-word conversation gate state
+    gate_active = True  # Active initially for startup greeting
+    last_active_time = time.time()
+    ACTIVE_TIMEOUT = 8.0  # 8-second follow-up window for back-and-forth dialogue
+
+    turn_audio_buffer = []
+    turn_allowed = False
+
     try:
         while audio_mgr.is_running:
             async for response in session.receive():
                 if not audio_mgr.is_running:
                     break
 
-                # Check for server content (audio + text)
+                # Check for server content (audio + text + transcription)
                 server_content = response.server_content
                 if server_content is not None:
-                    # Process returned model output parts
+                    # 1. Inspect real-time user speech transcription
+                    interim_trans = getattr(server_content, "interim_input_transcription", None)
+                    input_trans = getattr(server_content, "input_transcription", None)
+
+                    user_text = ""
+                    if interim_trans and interim_trans.text:
+                        user_text = interim_trans.text
+                    elif input_trans and input_trans.text:
+                        user_text = input_trans.text
+
+                    if user_text:
+                        # If transcript explicitly mentions Jarvis, activate immediately!
+                        if contains_wake_word(user_text):
+                            if not gate_active:
+                                print(f"\n⚡ [Wake Word Detected: \"Jarvis\"]", flush=True)
+                            gate_active = True
+                            turn_allowed = True
+                            last_active_time = time.time()
+                            log_transcript("USER", user_text)
+
+                            # Release any buffered audio chunks to speakers right away
+                            if turn_audio_buffer:
+                                for b_chunk in turn_audio_buffer:
+                                    if not speaking:
+                                        print("\r🔊 JARVIS: [Speaking...] ", end="", flush=True)
+                                        speaking = True
+                                    audio_mgr.queue_output(b_chunk)
+                                turn_audio_buffer.clear()
+                        elif gate_active and (time.time() - last_active_time <= ACTIVE_TIMEOUT):
+                            # Within follow-up window, continue conversation
+                            turn_allowed = True
+                            last_active_time = time.time()
+                            log_transcript("USER", user_text)
+
+                    # 2. Process returned model output parts
                     model_turn = getattr(server_content, "model_turn", None)
                     if model_turn is not None:
+                        # Check if active follow-up window has elapsed
+                        if gate_active and (time.time() - last_active_time > ACTIVE_TIMEOUT):
+                            gate_active = False
+                            print("\n💤 [JARVIS entered Standby. Say 'Jarvis' to activate.]\n", flush=True)
+                            log_event("GATE_STATE", {"state": "STANDBY", "reason": "timeout"})
+
                         for part in model_turn.parts:
                             # Stream audio output to speaker queue
                             if part.inline_data and part.inline_data.data:
-                                if not speaking:
-                                    print("\r🔊 JARVIS: [Speaking...] ", end="", flush=True)
-                                    speaking = True
-                                audio_mgr.queue_output(part.inline_data.data)
+                                chunk = part.inline_data.data
+                                if turn_allowed or gate_active:
+                                    if not speaking:
+                                        print("\r🔊 JARVIS: [Speaking...] ", end="", flush=True)
+                                        speaking = True
+                                    audio_mgr.queue_output(chunk)
+                                else:
+                                    # In standby: buffer initial chunks while awaiting transcription
+                                    turn_audio_buffer.append(chunk)
+                                    if len(turn_audio_buffer) > 25:
+                                        turn_audio_buffer.pop(0)
 
                             # Print spoken transcript text if available
                             is_thought = getattr(part, "thought", False)
                             if part.text and not is_thought:
-                                print(part.text, end="", flush=True)
-                                current_transcript.append(part.text)
+                                if turn_allowed or gate_active:
+                                    print(part.text, end="", flush=True)
+                                    current_transcript.append(part.text)
 
                     if getattr(server_content, "turn_complete", False):
-                        if current_transcript:
-                            full_text = "".join(current_transcript).strip()
-                            log_transcript("JARVIS", full_text)
-                            current_transcript.clear()
-                        if speaking:
-                            print("✓\n🟢 JARVIS is listening...\n", flush=True)
-                            speaking = False
+                        if not (turn_allowed or gate_active):
+                            if turn_audio_buffer:
+                                turn_audio_buffer.clear()
+                            print("\r💤 [Ambient speech ignored - Say 'Jarvis' to address JARVIS]  ", flush=True)
+                        else:
+                            if speaking:
+                                print("✓\n🟢 JARVIS is listening...\n", flush=True)
+                                speaking = False
+                            if current_transcript:
+                                full_text = "".join(current_transcript).strip()
+                                log_transcript("JARVIS", full_text)
+                                current_transcript.clear()
+                            last_active_time = time.time()
+                            gate_active = True
+
+                        # Reset per-turn flags
+                        turn_audio_buffer.clear()
+                        turn_allowed = False
 
                 # Check for GoAway signal (session duration limit reached by Google)
                 if response.go_away is not None:
@@ -228,7 +320,7 @@ async def run_session():
 
     audio_mgr = AudioManager()
 
-    # Configure the Gemini Live Session with zero thinking delay for instant speech
+    # Configure the Gemini Live Session with input audio transcription for wake-word detection
     config = types.LiveConnectConfig(
         response_modalities=["AUDIO"],
         speech_config=types.SpeechConfig(
@@ -237,6 +329,7 @@ async def run_session():
             )
         ),
         thinking_config=types.ThinkingConfig(thinking_budget=0, include_thoughts=False),
+        input_audio_transcription=types.AudioTranscriptionConfig(),
         system_instruction=types.Content(
             parts=[types.Part.from_text(text=SYSTEM_INSTRUCTION)]
         ),
@@ -252,7 +345,7 @@ async def run_session():
             audio_mgr.start(loop)
             log_session_lifecycle("CONNECTED", {"model": MODEL_ID, "voice": VOICE_NAME})
             print("🟢 J.A.R.V.I.S. is online. All protocols fully operational.")
-            print("   Speak naturally to issue commands, search files, or inspect diagnostics.\n")
+            print("   🎙️  Wake word: Start your request with 'Jarvis' (e.g. 'Jarvis, check my system')\n")
 
             # Initial spoken greeting to announce arrival aloud
             await session.send_client_content(
